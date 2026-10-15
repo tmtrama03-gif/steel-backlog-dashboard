@@ -454,8 +454,13 @@
           <span class="ic">📥</span> นำเข้าข้อมูลอัพเดท
         </button>
         <input type="file" id="importFileInput" accept=".xls,.XLS,.txt,.tsv,.csv" style="display:none;">
+        <button class="refresh-btn" id="importDOBtn" title="อัพโหลดไฟล์รายงานการส่งสินค้า (DO) เพื่ออัพเดทยอดขาย (บาท) และน้ำหนักส่งจริงรายเดือน">
+          <span class="ic">📥</span> นำเข้าข้อมูล DO
+        </button>
+        <input type="file" id="importDOFileInput" accept=".xls,.XLS,.txt,.tsv,.csv" style="display:none;">
       </div>
       <div id="importStatus" style="display:none; margin-top:8px; font-size:12px; font-weight:600; text-align:right;"></div>
+      <div id="importDOStatus" style="display:none; margin-top:4px; font-size:12px; font-weight:600; text-align:right;"></div>
       <div id="importResetRow" style="display:none; margin-top:4px; text-align:right;">
         <a href="#" id="importResetLink" style="font-size:11.5px; color:var(--text-mute); text-decoration:underline;">คืนค่าเป็นข้อมูลต้นฉบับ (ล้างข้อมูลที่อัพโหลดเอง)</a>
       </div>
@@ -841,6 +846,52 @@
 <script>
 (function(){
   "use strict";
+  // ---- baseline DO-reported figures (weight_shipped_actual / do_count / so_count_actual / revenue),
+  // read directly from the originally-baked #dashdata JSON (not from a possibly-cached/overridden DATA) ----
+  const BASELINE_DASHDATA = JSON.parse(document.getElementById('dashdata').textContent);
+  const BASELINE_DO_BY_MONTH = (function(){
+    const out = {};
+    (BASELINE_DASHDATA.monthly||[]).forEach(m=>{
+      out[m.month] = { weight_shipped_actual: m.weight_shipped_actual, do_count: m.do_count, so_count_actual: m.so_count_actual };
+    });
+    (BASELINE_DASHDATA.monthly_revenue||[]).forEach(r=>{
+      if(!out[r.month]) out[r.month] = {};
+      out[r.month].revenue = r.revenue;
+    });
+    return out;
+  })();
+  // Overlays the baseline DO figures above, plus any DO file the user has imported via the browser
+  // (persisted in localStorage under 'dashboardDOOverride'), onto an aggregated data object — touching
+  // only weight_shipped_actual / do_count / so_count_actual (monthly[]) and revenue (monthly_revenue[]).
+  // Never touches weight_ordered / weight_shipped / weight_remaining — those stay exclusively SO-derived.
+  function applyDOOverride(agg, overrideRec){
+    if(overrideRec===undefined){
+      try{ const raw = localStorage.getItem('dashboardDOOverride'); overrideRec = raw ? JSON.parse(raw) : null; }
+      catch(e){ overrideRec = null; }
+    }
+    const byMonth = Object.assign({}, BASELINE_DO_BY_MONTH, (overrideRec && overrideRec.byMonth) || {});
+    const monthMap = new Map((agg.monthly||[]).map(m=>[m.month, Object.assign({}, m)]));
+    const revMap = new Map((agg.monthly_revenue||[]).map(r=>[r.month, Object.assign({}, r)]));
+    Object.keys(byMonth).forEach(month=>{
+      const ov = byMonth[month];
+      const existing = monthMap.get(month) || {month, orders:0, lines:0, weight_ordered:0, weight_shipped:0, weight_remaining:0};
+      if(ov.weight_shipped_actual!=null || ov.do_count!=null || ov.so_count_actual!=null){
+        monthMap.set(month, Object.assign({}, existing, {
+          weight_shipped_actual: ov.weight_shipped_actual, do_count: ov.do_count, so_count_actual: ov.so_count_actual
+        }));
+      }
+      if(ov.revenue!=null){
+        const existingRev = revMap.get(month) || {month, revenue:0};
+        revMap.set(month, Object.assign({}, existingRev, {revenue: ov.revenue}));
+      }
+    });
+    agg.monthly = Array.from(monthMap.values()).sort((a,b)=> a.month<b.month?-1:1);
+    agg.monthly_revenue = Array.from(revMap.values()).sort((a,b)=> a.month<b.month?-1:1);
+    let totalDo=0, totalSoActual=0;
+    agg.monthly.forEach(m=>{ totalDo+=(m.do_count||0); totalSoActual+=(m.so_count_actual||0); });
+    agg.meta = Object.assign({}, agg.meta, { total_do_count: totalDo, total_so_count_actual: totalSoActual });
+    return agg;
+  }
   let DATA = (function(){
     try{
       const cached = localStorage.getItem('dashboardData');
@@ -848,6 +899,7 @@
     }catch(e){}
     return JSON.parse(document.getElementById('dashdata').textContent);
   })();
+  DATA = applyDOOverride(DATA);
   const fmtInt = n => Math.round(n).toLocaleString('th-TH');
   // น้ำหนักทุกจุดในแดชบอร์ดเก็บเป็น กก. ภายใน แต่แสดงผลเป็น "ตัน" (หาร 1000) เสมอ
   const fmtKg = n => (n/1000).toLocaleString('th-TH', {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -1224,6 +1276,82 @@
       return kept.concat(newRows);
     }
 
+    // ---- DO (รายงานการส่งสินค้า) import: same generic multi-row-header SAP-export parser as parseSapText,
+    // anchored on 'Actual GI date' instead of 'Overall blocked status'. This file format happens to have
+    // a single header row (N=1), so the multi-row grouping degrades to one-row-per-record automatically. ----
+    function parseDOText(text){
+      const lines = text.split(/\r\n|\n|\r/);
+      const rows = lines.map(l=>l.split('\t'));
+      const isBlank = r => r.every(c=>c==null || c.trim()==='');
+      const isSubtotal = r => r.length>1 && (['*','**'].indexOf((r[1]||'').trim())!==-1);
+      let hstart = -1;
+      for(let i=0;i<rows.length;i++){
+        if(rows[i].some(c=>(c||'').trim()==='Actual GI date')){ hstart=i; break; }
+      }
+      if(hstart===-1) throw new Error('ไม่พบหัวตาราง (Actual GI date) ในไฟล์ที่อัพโหลด — กรุณาตรวจสอบว่าเป็นไฟล์รายงานการส่งสินค้า (DO) ที่ถูกต้อง (ต้องมีคอลัมน์ Actual GI date และ Total Amount)');
+      let hend = hstart;
+      while(hend<rows.length && !isBlank(rows[hend])) hend++;
+      const headerRows = rows.slice(hstart, hend);
+      const N = headerRows.length;
+      const hdrs = headerRows.map(hr=>{
+        const d={}; hr.forEach((v,i)=>{ if(v!=null && v.trim()!=='') d[i]=v.trim(); }); return d;
+      });
+      let dataStart = hend;
+      while(dataStart<rows.length && isBlank(rows[dataStart])) dataStart++;
+      const dataRows = rows.slice(dataStart).filter(r=>!isBlank(r) && !isSubtotal(r));
+      if(N===0 || dataRows.length % N !== 0){
+        throw new Error('โครงสร้างไฟล์ไม่ตรงกับรูปแบบที่รองรับ (จำนวนแถวข้อมูลไม่สอดคล้องกับหัวตาราง) กรุณาตรวจสอบไฟล์อีกครั้ง');
+      }
+      const records = [];
+      for(let i=0;i<dataRows.length;i+=N){
+        const rec = {};
+        for(let offset=0; offset<N; offset++){
+          const row = dataRows[i+offset], hdr = hdrs[offset];
+          Object.keys(hdr).forEach(cStr=>{
+            const c = +cStr;
+            rec[hdr[cStr]] = c<row.length ? row[c] : null;
+          });
+        }
+        records.push(rec);
+      }
+      if(!records.length) throw new Error('ไม่พบแถวข้อมูลในไฟล์ที่อัพโหลด');
+      return records;
+    }
+
+    function transformDORecords(records){
+      return records.map(rec=>{
+        const gi_date = parseThaiDate(rec['Actual GI date']);
+        const totalAmtRaw = cleanStr(rec['Total Amount']);
+        const revenue = totalAmtRaw!=null ? parseNum(totalAmtRaw) : (parseNum(rec['Total after Discount']) + parseNum(rec['Vat']));
+        return {
+          gi_date,
+          month: gi_date ? gi_date.slice(0,7) : null,
+          so: cleanStr(rec['Sale Order No.']),
+          delivery: cleanStr(rec['Delivery no.']),
+          weight: parseNum(rec['Net Weight']),
+          revenue,
+        };
+      });
+    }
+
+    // per-month replace semantics, same idea as mergeRows: a touched month's figures are fully replaced
+    function aggregateDOByMonth(doRows){
+      const map = new Map();
+      doRows.forEach(r=>{
+        if(!r.month) return;
+        if(!map.has(r.month)) map.set(r.month, {weight:0, revenue:0, soSet:new Set(), doSet:new Set()});
+        const m = map.get(r.month);
+        m.weight += r.weight; m.revenue += r.revenue;
+        if(r.so!=null) m.soSet.add(r.so);
+        if(r.delivery!=null) m.doSet.add(r.delivery);
+      });
+      const out = {};
+      map.forEach((m, month)=>{
+        out[month] = { weight_shipped_actual: round2(m.weight), revenue: round2(m.revenue), do_count: m.doSet.size, so_count_actual: m.soSet.size };
+      });
+      return out;
+    }
+
     // ---- port of build_dashdata_v3.py aggregation logic ----
     function aggregateAll(rows){
       const soAll=new Set(), custAll=new Set();
@@ -1355,8 +1483,8 @@
         backlog_rows, grouped_product, product_meta, grouped_material, cancelled_rows };
     }
 
-    function showStatus(msg, kind){
-      const el = document.getElementById('importStatus');
+    function showStatus(msg, kind, elId){
+      const el = document.getElementById(elId || 'importStatus');
       if(!el) return;
       el.style.display = 'block';
       el.style.color = kind==='error' ? 'var(--critical)' : (kind==='ok' ? 'var(--good)' : (kind==='warn' ? 'var(--warning)' : 'var(--text-mute)'));
@@ -1367,7 +1495,7 @@
       const row = document.getElementById('importResetRow');
       if(!row) return;
       let hasOverride = false;
-      try{ hasOverride = !!localStorage.getItem('dashboardData'); }catch(e){}
+      try{ hasOverride = !!localStorage.getItem('dashboardData') || !!localStorage.getItem('dashboardDOOverride'); }catch(e){}
       row.style.display = hasOverride ? 'block' : 'none';
     }
 
@@ -1417,6 +1545,7 @@
             file1_name: file.name,
           });
           agg.monthly_revenue = DATA.monthly_revenue;
+          applyDOOverride(agg); // re-apply baseline/DO-imported weight_shipped_actual, do_count, so_count_actual, revenue per month — this SO file never carries those
 
           cachedRows = merged;
           try{ localStorage.setItem('dashboardRawRows', JSON.stringify(encodeRows(merged))); }catch(err){ /* raw-rows cache too large for this browser's quota — later imports in this tab still work from memory */ }
@@ -1437,9 +1566,57 @@
       reader.readAsArrayBuffer(file);
     }
 
+    // DO (รายงานการส่งสินค้า) import: updates only weight_shipped_actual / do_count / so_count_actual
+    // (monthly[]) and revenue (monthly_revenue[]) for the touched months — never weight_ordered /
+    // weight_shipped / weight_remaining, which stay exclusively SO-derived (see applyDOOverride above).
+    function handleDOFile(file){
+      showStatus('กำลังอ่านไฟล์ "'+file.name+'" …', 'info', 'importDOStatus');
+      const reader = new FileReader();
+      reader.onerror = function(){ showStatus('อ่านไฟล์ไม่สำเร็จ กรุณาลองใหม่อีกครั้ง', 'error', 'importDOStatus'); };
+      reader.onload = function(e){
+        try{
+          const buf = e.target.result;
+          const bytes = new Uint8Array(buf);
+          let text;
+          if(bytes.length>=2 && bytes[0]===0xFF && bytes[1]===0xFE){ text = new TextDecoder('utf-16le').decode(buf); }
+          else if(bytes.length>=2 && bytes[0]===0xFE && bytes[1]===0xFF){ text = new TextDecoder('utf-16be').decode(buf); }
+          else {
+            try{ text = new TextDecoder('utf-16le').decode(buf); }
+            catch(err){ text = new TextDecoder('utf-8').decode(buf); }
+            if(text.indexOf('Actual GI date')===-1) text = new TextDecoder('utf-8').decode(buf);
+          }
+          const records = parseDOText(text);
+          const doRows = transformDORecords(records).filter(r=>r.month);
+          if(!doRows.length) throw new Error('ไม่พบแถวข้อมูลที่มีวันที่ Actual GI date ที่อ่านได้ในไฟล์นี้');
+          const newByMonth = aggregateDOByMonth(doRows);
+
+          let stored = {byMonth:{}};
+          try{ const raw = localStorage.getItem('dashboardDOOverride'); if(raw) stored = JSON.parse(raw); }catch(err){}
+          const mergedByMonth = Object.assign({}, stored.byMonth, newByMonth); // per-month replace, same idea as mergeRows
+          const newestDate = doRows.reduce((mx,r)=> (r.gi_date && (!mx||r.gi_date>mx)) ? r.gi_date : mx, null);
+          const overrideRec = { byMonth: mergedByMonth, file_name: file.name, data_asof: newestDate || stored.data_asof };
+          try{ localStorage.setItem('dashboardDOOverride', JSON.stringify(overrideRec)); }catch(err){ /* storage blocked — import still applied in-memory for this session */ }
+
+          DATA = applyDOOverride(DATA, overrideRec);
+          try{ localStorage.setItem('dashboardData', JSON.stringify(DATA)); }catch(err){ /* storage blocked — import still applied in-memory for this session */ }
+
+          rerenderAll();
+          refreshResetLinkVisibility();
+          const touchedMonths = Object.keys(newByMonth).sort();
+          showStatus('อัพเดทยอดขาย (บาท) และน้ำหนักส่งจริงสำเร็จ: เดือน '+touchedMonths.join(', ')+' ('+doRows.length.toLocaleString('th-TH')+' แถว)', 'ok', 'importDOStatus');
+        }catch(err){
+          console.error(err);
+          showStatus('นำเข้าไฟล์ DO ไม่สำเร็จ: '+err.message, 'error', 'importDOStatus');
+        }
+      };
+      reader.readAsArrayBuffer(file);
+    }
+
     function init(){
       const btn = document.getElementById('importBtn');
       const input = document.getElementById('importFileInput');
+      const btnDO = document.getElementById('importDOBtn');
+      const inputDO = document.getElementById('importDOFileInput');
       const resetLink = document.getElementById('importResetLink');
       if(btn && input){
         btn.addEventListener('click', ()=> input.click());
@@ -1448,10 +1625,17 @@
           input.value = '';
         });
       }
+      if(btnDO && inputDO){
+        btnDO.addEventListener('click', ()=> inputDO.click());
+        inputDO.addEventListener('change', ()=>{
+          if(inputDO.files && inputDO.files[0]) handleDOFile(inputDO.files[0]);
+          inputDO.value = '';
+        });
+      }
       if(resetLink){
         resetLink.addEventListener('click', (ev)=>{
           ev.preventDefault();
-          try{ localStorage.removeItem('dashboardData'); localStorage.removeItem('dashboardRawRows'); }catch(e){}
+          try{ localStorage.removeItem('dashboardData'); localStorage.removeItem('dashboardRawRows'); localStorage.removeItem('dashboardDOOverride'); }catch(e){}
           location.reload();
         });
       }
